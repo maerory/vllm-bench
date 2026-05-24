@@ -1,0 +1,182 @@
+[
+  {
+    "id": "short_01",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "Explain what a hash table is and what operation it makes fast."
+  },
+  {
+    "id": "short_02",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "Write a short paragraph describing a rainy afternoon in a small coastal town."
+  },
+  {
+    "id": "short_03",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "What is the difference between TCP and UDP? Give a concrete example use case for each."
+  },
+  {
+    "id": "short_04",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "Summarize the plot of Hamlet in three sentences."
+  },
+  {
+    "id": "short_05",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "Explain the difference between weather and climate, with an example of each."
+  },
+  {
+    "id": "short_06",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "If a train leaves Seoul at 9am traveling 100 km/h, and Busan is 400 km away, when does it arrive? Show your reasoning."
+  },
+  {
+    "id": "short_07",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "What is photosynthesis, and what are its inputs and outputs?"
+  },
+  {
+    "id": "short_08",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "Describe what a stack data structure is and give two real-world examples of where stacks appear in computing."
+  },
+  {
+    "id": "short_09",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "Write a four-line poem about the moon."
+  },
+  {
+    "id": "short_10",
+    "tier": "short",
+    "target_tokens": 50,
+    "prompt": "What is the central limit theorem, in plain language?"
+  },
+  {
+    "id": "medium_01",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "I'm trying to choose between using a SQL database and a NoSQL document store for a new application. The application is a content management system where users create, edit, and tag articles, each article has structured metadata (author, date, tags, status) and a freeform body, and we expect to need full-text search over article content. Walk me through how I should think about this decision. What are the main trade-offs, and what questions about my application should I be answering before I pick? Cover at least three distinct factors."
+  },
+  {
+    "id": "medium_02",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Write the opening of a short story set in a quiet bookshop on a rainy evening. The bookshop is owned by an elderly woman named Marta who has run it for forty years. A young man enters the shop looking for a specific book he remembers from his childhood but cannot name. The scene should establish the atmosphere of the bookshop, introduce the two characters, and end at the moment Marta starts walking toward the section where she thinks the book might be. Aim for around 200 words and use specific sensory details."
+  },
+  {
+    "id": "medium_03",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Explain the concept of overfitting in machine learning. Cover: what it is in plain terms, why it happens, how you can recognize it in practice (what signals tell you a model is overfitting), and at least three standard techniques used to reduce it. Assume the reader knows basic statistics and has built a simple regression or classification model before, but is not yet familiar with regularization techniques."
+  },
+  {
+    "id": "medium_04",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Describe what happens, step by step, when you type a URL into your browser and press enter. Cover at minimum: DNS resolution, the TCP/TLS handshake, the HTTP request, what the server does on its side, the response coming back, and the browser rendering the page. The audience is a computer science student who has just finished an intro networking course, so you can use technical terms but should explain anything beyond intro level. Aim for thoroughness over brevity."
+  },
+  {
+    "id": "medium_05",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "I'm planning a one-week trip to Japan in late October and I want to spend most of it outside Tokyo. I enjoy hiking, traditional architecture, and small-town food culture. I am less interested in major tourist hubs and prefer slower-paced travel. Suggest a rough itinerary that hits two or three regions, with one or two specific things to do or see in each, and a brief note on how to get between them. Don't worry about exact pricing or accommodations; focus on the shape of the trip."
+  },
+  {
+    "id": "medium_06",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Explain the difference between synchronous and asynchronous programming, using Python as the reference language. Cover: what each model means conceptually, when you would reach for async over sync, what kinds of workloads benefit from async and which do not, and what the main pitfalls are (things that surprise people the first few times they write async code). Use code-level intuition rather than formal computer science terminology where possible."
+  },
+  {
+    "id": "medium_07",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Compare and contrast three approaches to handling user authentication in a modern web application: session-based authentication with cookies, JWT-based stateless authentication, and OAuth delegation to a third party. For each, briefly explain how it works, what its main advantages are, what its main drawbacks are, and a typical situation where you would choose it over the others."
+  },
+  {
+    "id": "medium_08",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Walk through how mortgage amortization works. Start from the basic loan parameters (principal, interest rate, term), explain why early payments are mostly interest and later payments are mostly principal, and describe what happens to the amortization schedule if the borrower makes an extra payment toward principal. Use a concrete example with round numbers to make the dynamic clear. Assume the reader is financially literate but has never carefully looked at an amortization table."
+  },
+  {
+    "id": "medium_09",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "I'm starting strength training for the first time at age 35 and I want to focus on building a foundation rather than chasing maximum weights. I have access to a typical commercial gym with free weights and machines. Give me your reasoning for what kind of program structure would suit a beginner in this situation, what the main exercises should be, how to think about progression in the first three months, and what mistakes beginners typically make that I should avoid."
+  },
+  {
+    "id": "medium_10",
+    "tier": "medium",
+    "target_tokens": 200,
+    "prompt": "Explain how a Kalman filter works, intuitively, to someone with a strong math background but no signal processing experience. Cover: what problem it solves, why naive approaches (like just averaging measurements) are inadequate, the two-step prediction/update structure, and the role of the covariance matrices. You can use equations sparingly but the emphasis should be on conceptual understanding rather than derivation."
+  },
+  {
+    "id": "long_01",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'm preparing for a senior engineering interview at a company that builds LLM-based products, and I want to make sure I can speak fluently about the trade-offs involved in serving large language models in production. Walk me through a comprehensive picture of what matters when you're operating an LLM inference service at scale. I'd like you to cover, in some depth: the relationship between throughput and latency and why optimizing one tends to hurt the other; what continuous batching is and how it differs from static batching; what the KV cache is, why it dominates memory at long contexts, and what techniques exist to manage it (including paging, eviction, and prefix caching); the difference between the prefill and decode phases of inference and what they each cost in terms of compute and memory; how quantization changes the picture and what the main trade-offs are; and finally, how you would think about cost-per-token economics when deciding whether to self-host versus use a third-party API. Be thorough but stay practical; the goal is for me to leave the conversation with a clearer mental model, not a list of buzzwords."
+  },
+  {
+    "id": "long_02",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'd like to better understand the history and current state of monetary policy in the United States, and how the Federal Reserve actually influences the economy. Walk me through this in a structured way. Start with a brief history: how and when the Fed was created, what problems it was designed to solve, and how its mandate has evolved over time. Then explain the main tools the Fed uses today (the federal funds rate, open market operations, the discount window, reserve requirements, and quantitative easing or tightening), how each one is supposed to work in theory, and what the transmission mechanism looks like, that is, how a change in the Fed's policy actually propagates through markets and the real economy. Then describe the central tensions the Fed faces, particularly between its dual mandate of price stability and maximum employment, and how it tries to balance them. Finally, sketch out some of the major debates economists have about Fed policy today, including disagreements about how effective monetary policy actually is at influencing inflation versus how much is determined by fiscal policy and supply-side factors. Aim for clarity and structure over comprehensiveness; I'd rather understand the main ideas well than get a survey of every detail."
+  },
+  {
+    "id": "long_03",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "Write a short story, approximately 400 words, with the following constraints. The protagonist is a lighthouse keeper named Aren who has been alone on his island for six months. One evening, after a heavy storm, a small wooden boat washes up on the rocks with a single passenger: a woman, conscious but exhausted, who claims she does not remember where she came from. The story should take place over a single night, from the moment Aren spots the boat to the early hours of the morning when the woman finally falls asleep in his spare room. The story should be told in close third person from Aren's perspective. It should establish Aren's solitude and his guardedness without stating them directly, introduce the woman in a way that creates mild ambiguity about whether her amnesia is genuine, and end on a note of unresolved tension rather than resolution. Avoid melodrama. Pay attention to the small concrete details that make a lighthouse setting feel real: the smell of kerosene, the rhythm of the light, the sound of the sea. The story should not contain any dialogue that explains the woman's backstory."
+  },
+  {
+    "id": "long_04",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'm trying to develop a more sophisticated understanding of how to evaluate investment opportunities, particularly in publicly traded equities. I have a basic grasp of financial statements (income statement, balance sheet, cash flow) but I want to move beyond rote ratio analysis toward something more like the way an experienced investor actually thinks about a business. Walk me through a structured framework for evaluating a company as a long-term investment. Cover, in some depth: how to assess the quality of a business (durable competitive advantages, return on invested capital, capital allocation track record); how to think about valuation in a way that isn't reducible to a single multiple (the relationship between growth, profitability, and the multiple a business deserves); how to evaluate management (what to look for in capital allocation decisions, compensation structure, and how management communicates with shareholders); and how to think about the risks that don't show up in spreadsheets (regulatory exposure, technological disruption, balance sheet fragility under stress). For each section, give me a concrete example or two of what good versus bad looks like. Assume the audience has done some investing but is still in the phase of moving from intermediate to advanced."
+  },
+  {
+    "id": "long_05",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'd like to understand the architecture of modern transformer-based language models in detail, from input to output. Walk me through the full data flow of a single forward pass through a decoder-only transformer like GPT or LLaMA. Start with the input: how raw text becomes tokens, what tokenization actually does, and how tokens are converted into embedding vectors. Then describe what happens in a single transformer block: the role of layer normalization, the structure of the self-attention mechanism (query/key/value projections, scaled dot-product attention, multi-head attention, and the role of causal masking), and the structure of the feedforward network that follows. Explain why residual connections matter and what position embeddings (including modern variants like RoPE) accomplish. Then describe how the output of the final block is projected back into vocabulary space to produce logits, and how those logits are sampled (or argmaxed) to produce the next token. Throughout, be concrete about tensor shapes wherever it helps clarify the mechanics. The audience is an ML practitioner who has used transformers in code but wants a clearer mental model of what's actually happening inside the forward pass."
+  },
+  {
+    "id": "long_06",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'm trying to design a backend architecture for a new mobile application and I want your help thinking through it carefully. The application is a habit-tracking app where users define personal habits (e.g., daily meditation, weekly long run, monthly journal review), check them off as they complete them, and receive simple analytics over time (streaks, completion rates, weekly summaries). We expect modest scale initially but want to design for growth: somewhere in the range of low millions of users within two years if things go well. The product is mobile-first (iOS and Android), with no immediate need for a web interface, though we don't want to preclude one. Walk me through how you would approach the architecture: what services or components you would build, what data model you would propose, what database choices you would make and why, how you would think about authentication and user management, what infrastructure choices you would make for hosting and scaling, and what observability you would put in place from day one. Be opinionated; tell me what you would actually build, not a survey of every possible option. Highlight the decisions where you would be most willing to be wrong and would revisit early, versus the ones that are foundational and hard to change later."
+  },
+  {
+    "id": "long_07",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I want to understand the philosophical concept of free will and the main contemporary positions in the debate, in a structured way. Start by laying out the problem: what is it about human action that makes free will philosophically interesting or troubling, and how is the question typically framed in relation to determinism? Then walk through the main positions in the modern debate. First, hard determinism: the view that determinism is true and therefore free will does not exist, and what its main proponents argue. Second, libertarian free will (in the philosophical sense, not the political one): the view that we do have genuine free will and determinism is therefore false at least in some relevant sense, and what kinds of arguments support this. Third, compatibilism: the view that free will and determinism are not in conflict properly understood, and how compatibilists redefine 'free will' to make this work. For each position, give the strongest version of the argument, the main objections it faces, and the philosophers most associated with it. End with a brief note on why this debate remains unresolved and what is at stake practically, e.g. for our concepts of moral responsibility and the justification for punishment. Be rigorous but accessible; the audience has read some philosophy but is not a specialist."
+  },
+  {
+    "id": "long_08",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'd like a detailed comparison of three approaches to building a recommendation system for a content platform (say, a streaming service for video or music). The three approaches I want you to compare are: collaborative filtering (in both its user-based and item-based forms, and matrix factorization variants), content-based filtering using item features, and modern deep-learning-based approaches (including two-tower models and sequential/transformer-based recommenders). For each, explain how the approach works conceptually, what kind of data it needs, what its main strengths and weaknesses are, and what failure modes are common in practice (e.g., cold start, popularity bias, filter bubbles). Then discuss how production systems typically combine these approaches rather than relying on any one of them, and what the role of candidate generation versus ranking is in a typical two-stage pipeline. Finally, touch briefly on how evaluation works for recommenders, why offline metrics often disagree with online A/B test results, and what teams typically do about this. The audience is an ML engineer building a recommender for the first time."
+  },
+  {
+    "id": "long_09",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "Walk me through the history of how astronomers measured the size of the universe, from the ancient Greeks to today. Begin with the earliest attempts: Eratosthenes measuring the circumference of the Earth, and the Greek attempts to measure the distance to the Moon and Sun using geometry. Then describe the transition to measuring stellar distances: how parallax works in principle, why it took until the 19th century to actually measure a stellar parallax, and what that first measurement implied about the scale of the galaxy. Then describe the breakthrough of the early 20th century: Henrietta Leavitt's discovery of the period-luminosity relationship in Cepheid variables, how that gave astronomers a 'standard candle' to measure distances beyond parallax range, and how Edwin Hubble used Cepheids to demonstrate that the Andromeda 'nebula' was actually a separate galaxy outside our own. Continue through the 20th century: Hubble's discovery of the expansion of the universe, the cosmic distance ladder built from successive overlapping methods (Cepheids, Type Ia supernovae, redshift), and how modern measurements of the Hubble constant are made. End with a note on the current 'Hubble tension', the disagreement between local and CMB-based measurements of the expansion rate, and why it matters. Aim for narrative coherence; this is a story, not a list."
+  },
+  {
+    "id": "long_10",
+    "tier": "long",
+    "target_tokens": 500,
+    "prompt": "I'd like you to help me think through how to structure my own learning for the next twelve months. My context: I'm a software engineer in my early thirties with about ten years of experience, currently mid-career, and I want to deepen my expertise in machine learning systems specifically, with the eventual goal of being able to lead the design and operation of LLM-based products at a senior level. I already have strong general software engineering skills, comfort with Python, working knowledge of standard ML concepts, and some hands-on experience deploying models. The gaps I'm aware of are: I have limited hands-on experience with the specifics of LLM training and fine-tuning, I have only conceptual familiarity with inference optimization (batching, KV cache, quantization), I have read about distributed systems for ML but never built anything serious, and my mathematical foundations (especially in optimization and probability) feel rustier than I'd like. Help me design a year-long structured learning plan: how would you break this down into phases, what resources or kinds of resources would you prioritize at each phase, how would you balance reading versus doing, and what 'evidence of learning' should I be producing along the way to know I'm actually progressing rather than just consuming material? Be specific and opinionated."
+  }
+]
