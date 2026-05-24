@@ -116,6 +116,136 @@ Tokenizers ship with models. Token ID 12345 means whatever the tokenizer says it
 
 ---
 
+---
+
+## Session 2 — Designing the benchmark harness
+
+**Goal:** Build the measurement code (the "harness"), prove it produces sensible numbers at concurrency 1 only. Concurrency >1 is session 3.
+
+### Concepts I asked about
+
+#### What is a "harness"?
+
+Plain software-engineering term: a **benchmark harness** (or test harness) is code that exercises another piece of code in a controlled, instrumented way. Named after the literal harness that straps onto a horse — it "straps onto" the thing under test and collects measurements.
+
+In our project: `harness.py` is a script that loads prompts, calls the runner, records timestamps, and saves results. It does *not* implement generation — it *measures* generation.
+
+A bug in the model code makes the model produce bad text (visible). A bug in the harness makes the numbers wrong in ways that are invisible. Worth being paranoid about.
+
+(Not to be confused with "agentic harness" / "LLM harness" — same word, different domain. There, "harness" wraps an LLM with prompt-injection logic and tool-use loops. Same conceptual shape: wrap component + instrument. Different layer of the stack.)
+
+#### What is RPC, and why does it matter for TTFT?
+
+RPC = **Remote Procedure Call**. Call a function as if local; it executes on a different machine.
+
+When I write `runner.generate.remote(prompt)`:
+1. Local script serializes args to bytes
+2. Bytes sent over network to Modal
+3. Container deserializes, runs `generate(prompt)`, serializes return
+4. Bytes sent back
+5. Local script deserializes
+
+Each step takes time. The full round-trip = "RPC overhead", maybe 10–50ms outside the model's actual work.
+
+**Implication for TTFT semantics:**
+
+| Definition | What it includes | What it measures |
+|---|---|---|
+| Client-side TTFT | RPC + network + queueing + prefill | User experience |
+| Engine-side TTFT | prefill only | Pure model perf |
+
+I chose **client-side TTFT** because (a) it reflects what real serving costs, (b) same RPC overhead applies to both runners so it cancels in comparisons, (c) engine-side requires hooking into vLLM/transformers internals — annoying and engine-specific.
+
+Will document in the retro: "TTFT as measured includes Modal RPC overhead."
+
+#### Tokenizer vs embedding layer
+
+These are **separate** components with a clean boundary. Common confusion: the tokenizer does *not* do embeddings.
+
+Pipeline:
+```
+"Explain attention"
+       ↓
+   TOKENIZER  (vocab lookup + BPE merges)
+       ↓
+   [9908, 6529]                    ← integer IDs
+       ↓
+   EMBEDDING LAYER  (lookup in trained matrix)
+       ↓
+   [[-0.31, 0.82, ..., 0.05], ...]  ← shape: [seq_len, hidden_dim]
+       ↓
+   TRANSFORMER LAYERS
+       ↓
+   ...
+```
+
+- **Tokenizer:** deterministic string processor. Vocab (~152K entries for Qwen2.5) + BPE merge rules. Output is integers. No learned LLM parameters; vocab is learned separately and once during tokenizer training. Microseconds to run.
+- **Embedding layer:** learned matrix `[vocab_size, hidden_dim]`. Part of the model. For Qwen2.5-3B, ~150K × 2048 ≈ 300M params — meaningful chunk of total.
+
+Subtle bonus: at the *end* of the model, hidden states are projected back into vocab space to produce logits. In modern LLMs the projection ("unembedding") is usually **tied** to the embedding matrix — same params, transposed. So "embedding" plays a role at both ends. But that's still the model's job, not the tokenizer's.
+
+#### `add_generation_prompt=True` vs `False`
+
+Default for inference is `True` — appends `<|im_start|>assistant\n` so the model knows to start its turn.
+
+`False` is for:
+1. **Training / SFT data prep** — example includes the assistant's turn as text; you're not generating it
+2. **Perplexity / logprob scoring on complete conversations**
+3. **Manually appending tokens** — e.g., forcing assistant to start with a specific prefix
+4. **Multi-turn eval scripts where you control turn structure**
+
+For inference: always `True`. Good interview probe — knowing this distinction signals more than copy-paste familiarity with templating.
+
+#### Threading and GPU concurrency — the important one
+
+Why we use a thread in the streaming code: **producer-consumer control flow, not performance.**
+
+`model.generate()` blocks. The `TextIteratorStreamer` puts tokens into an internal queue *as they're produced*, but if `generate` is on the main thread, no one drains the queue until `generate` returns — defeating streaming. Putting `generate` on a background thread lets the main thread consume tokens as they're produced.
+
+**The much bigger lesson — why naive multi-threading doesn't give you concurrency on a single GPU:**
+
+LLM generation is **GPU-compute-bound**, not IO-bound. Workload types:
+
+| Type | Bottleneck | Threading helps? |
+|---|---|---|
+| IO-bound | network, disk waits | Yes (GIL released during waits) |
+| CPU-bound | Python interpreter math | No (GIL serializes) |
+| GPU-bound | GPU math | GIL is released, but... |
+
+For GPU-bound: GIL isn't the constraint, but **two threads each calling `model.generate` against the same model on one GPU don't run in parallel** — they contend for the GPU's compute resources, and CUDA serializes the work into a single execution stream. You'd get the same throughput as sequential, possibly worse (context-switching overhead).
+
+**This is exactly the problem vLLM exists to solve.** vLLM doesn't multi-thread; it runs *one* engine that **batches multiple in-flight requests at the model layer**. At each decode step, the GPU does the math for all active requests in a single batched forward pass. Parallelism happens *inside* the model forward, not via OS threading.
+
+The interview-ready phrasing:
+
+> "Naively threading multiple `generate` calls against a single GPU doesn't give you concurrency — they serialize at the GPU. vLLM achieves concurrency by batching at the model layer: at each forward pass, the GPU processes all in-flight requests as a single batched operation. That's what makes continuous batching architecturally different from just multi-threading a transformers loop."
+
+**Implication for session 3 baseline at concurrency >1:** there's no meaningful "transformers at concurrency 4" — option 1 (sequential, treat concurrency as N/A for the baseline) is the honest comparison. The asymmetry tells the right story: vLLM scales with concurrency, naive baseline doesn't.
+
+#### Modal: `.remote()` vs `.remote_gen()`
+
+Two different RPC protocols. Regular methods → `.remote()` (single request/response). Generator methods (anything with `yield`) → `.remote_gen()` (streaming response). Modal will reject the wrong variant with a clear error. Forgetting this is a one-line fix.
+
+### Design decisions this session
+
+| Decision | Why |
+|---|---|
+| Client-side TTFT (includes RPC overhead) | What users experience; same overhead on both runners cancels in comparisons; engine-side requires engine-specific hooks |
+| Harness lives on local machine, not in Modal | Simpler; timestamps reflect real client experience; matches Modal RPC pattern users would write |
+| Both runners get a `generate_stream` method, generator-style | Streaming is the only way to measure TTFT and per-token latency |
+| Generator yields `{"type": ..., ...}` envelopes | Carries token events + metadata events (prompt_info, done) in one stream |
+| Record raw per-token timestamps, not derived metrics | Can compute new metrics later without re-running |
+| Token count via re-tokenizing final output, not counting yields | `TextIteratorStreamer` yields *text fragments*, not tokens 1:1 |
+| Use `Thread` for transformers streaming | Producer-consumer pattern; not performance optimization |
+
+### What I want to keep in mind
+
+- The harness is where benchmark validity lives. A wrong measurement is worse than no measurement.
+- For session 2: concurrency 1 only. Resist the urge to add concurrency-4 mid-session.
+- Concurrency-1 numbers are a sanity check: vLLM and transformers should be in the same ballpark at concurrency 1. vLLM's win is *batching*, not single-stream speed. If concurrency-1 vLLM is 5x faster, something is measured wrong.
+
+---
+
 ## Open questions / parking lot
 
 Things I deferred and want to revisit:

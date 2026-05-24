@@ -77,6 +77,55 @@ class TransformerRunner:
         response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         return response
+    
+    @modal.method()
+    def generate_stream(self, prompt: str):
+        import torch
+        import time
+        from transformers import TextIteratorStreamer
+        from threading import Thread
+
+        # 1. Apply chat template, tokenize
+        messages = [
+            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        prompt_tokens = model_inputs.input_ids.shape[-1]
+
+        # 2. Set up the streamer
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+
+        # 3. Kick off generation in a background thread
+        gen_kwargs = dict(
+            **model_inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            streamer=streamer,
+        )
+        thread = Thread(target=self.model.generate, kwargs=gen_kwargs)
+        thread.start()
+
+        # 4. Stream tokens out with timestamps
+        # First yield: prompt_tokens (so the harness knows input length)
+        yield {"type": "prompt_info", "prompt_tokens": prompt_tokens}
+
+        for token_text in streamer:
+            yield {
+                "type": "token",
+                "text": token_text,
+                "server_ts": time.time(),
+            }
+        
+        thread.join()
+        yield {"type": "done"}
 
 
 @app.cls(
@@ -128,7 +177,7 @@ def main(runner: str = "transformers"):
     elif runner == "vllm":
         r = VLLMRunner()
     else:
-        raise ValueError(f"Unkown Runner: {runner}")
+        raise ValueError(f"Unknown Runner: {runner}")
     
     output = r.generate.remote(prompt)
     print("---PROMPT---")
