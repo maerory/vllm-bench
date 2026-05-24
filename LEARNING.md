@@ -222,10 +222,6 @@ The interview-ready phrasing:
 
 **Implication for session 3 baseline at concurrency >1:** there's no meaningful "transformers at concurrency 4" — option 1 (sequential, treat concurrency as N/A for the baseline) is the honest comparison. The asymmetry tells the right story: vLLM scales with concurrency, naive baseline doesn't.
 
-#### Modal: `.remote()` vs `.remote_gen()`
-
-Two different RPC protocols. Regular methods → `.remote()` (single request/response). Generator methods (anything with `yield`) → `.remote_gen()` (streaming response). Modal will reject the wrong variant with a clear error. Forgetting this is a one-line fix.
-
 ### Design decisions this session
 
 | Decision | Why |
@@ -243,6 +239,59 @@ Two different RPC protocols. Regular methods → `.remote()` (single request/res
 - The harness is where benchmark validity lives. A wrong measurement is worse than no measurement.
 - For session 2: concurrency 1 only. Resist the urge to add concurrency-4 mid-session.
 - Concurrency-1 numbers are a sanity check: vLLM and transformers should be in the same ballpark at concurrency 1. vLLM's win is *batching*, not single-stream speed. If concurrency-1 vLLM is 5x faster, something is measured wrong.
+
+---
+
+### First numbers: transformers runner at concurrency 1
+
+Ran all 30 prompts. Headline summary:
+
+| Tier | n | Prompt tok | Out tok | TTFT mean (ms) | Total (s) | Tput e2e (tok/s) | Tput decode (tok/s) | ITL mean (ms) |
+|---|---|---|---|---|---|---|---|---|
+| short | 10 | 45 | 203 | 442 | 7.84 | 25.4 | 27.8 | 35.9 |
+| medium | 10 | 119 | 256 | 430 | 9.89 | 25.9 | 27.1 | 37.0 |
+| long | 10 | 271 | 256 | 433 | 9.89 | 25.9 | 27.1 | 36.9 |
+
+**Headline finding: TTFT is effectively constant across tiers.**
+
+Prompt tokens scale 6x (45 → 271) but TTFT barely moves (442 → 433 ms). That's not what theory predicts — prefill cost should scale with prompt length. Three candidate explanations:
+
+1. **Modal RPC overhead dominates TTFT at these prompt sizes.** Network + serialization round-trip is probably 300-400ms by itself, hiding the prefill signal. Prefill for 271 tokens on A10G is plausibly only 60-150ms, well under the noise floor.
+2. **Prefill is genuinely fast at these sizes.** 3B model + bfloat16 + A10G is a quick combination; until you're in the thousands-of-tokens regime, prefill is cheap.
+3. **Some Modal cold-effect** — but warmup should rule this out.
+
+Interview-ready phrasing:
+
+> "On my setup, client-observed TTFT for prompts under ~300 tokens was dominated by network and RPC overhead, not prefill compute. To see prefill scale meaningfully you'd need much longer prompts or engine-side timing rather than client-side."
+
+**Second finding: decode throughput is remarkably stable across tiers.** ~26-27 tok/s regardless of prompt length. The KV cache cost of attending over a longer context isn't visible at this scale. Decode at this size is dominated by per-step model forward, not by attention scanning. Would invert at 4K+ context lengths.
+
+**Third finding: tier-level throughput averages are pulled down by prompts that stop early.** Several short-tier prompts (`short_04` Hamlet summary, `short_09` 4-line poem, `short_02` rainy afternoon) naturally hit EOS before the 256-token cap because their content invites short answers. This drags the short-tier mean total time down (~7.8s vs ~9.9s for medium/long) but the *generation rate* stays the same. The slightly lower short-tier e2e throughput (25.4 vs 25.9) is because TTFT becomes a larger fraction of total time when outputs are short.
+
+**Outlier: `short_09` (4-line poem).** 29 output tokens, ITL 30.7ms (lower than every other row). With only ~10 yield events the buffering-vs-real-decode-step ratio swings — this is the "yield events ≠ tokens" effect in extreme form. Don't overread.
+
+### Concepts learned from the data
+
+#### Yield events ≠ tokens
+
+`TextIteratorStreamer` doesn't flush one yield per token. It buffers BPE tokens until they form a clean UTF-8 string, then flushes. So `token_arrival_times` measures **yield arrival times, not per-token times**.
+
+The buffering pattern depends on content. For markdown-heavy output (`**Hash**`, `###`, numbered lists), tokens cluster into 3-4-yield batches at ~120ms intervals. For clean prose, you get roughly one yield per decode step at ~35-40ms intervals. Same underlying physics, different yield distributions.
+
+Implications:
+- Re-tokenize the output text to get the canonical `output_tokens` count. Counting yields is wrong.
+- Mean ITL from `np.diff(token_arrival_times)` is "mean per-yield gap," not "true per-token decode latency." For an honest decode-latency number, use `decode_time / output_tokens`.
+- Histograms of `np.diff(token_arrival_times)` are bimodal for some prompts. Percentile stats on them mean less than they look.
+
+#### KV cache cost grows with context length, but isn't visible at our scale
+
+In theory, every decode step attends over all prior keys/values (prompt + generated so far). At our prompt sizes (45-300 tokens), the per-step cost is dominated by the model forward pass, not by attention scanning. The data shows this clearly: decode throughput is flat across tiers.
+
+To make KV cache cost dominant you'd need prompts in the thousands of tokens, or generation runs long enough that the generated cache itself becomes the dominant context.
+
+#### `.remote()` vs `.remote_gen()` (Modal)
+
+Two different RPC protocols. Regular methods use `.remote()` (single request/response). Generator methods (anything with `yield`) require `.remote_gen()` (streaming response). Modal rejects the wrong variant with a clear error. One-line fix when it happens.
 
 ---
 
