@@ -140,18 +140,38 @@ class VLLMRunner:
         import os
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
 
-        from vllm import LLM, SamplingParams
+        from vllm import LLM, SamplingParams, AsyncLLMEngine, AsyncEngineArgs
         from transformers import AutoTokenizer
-        self.llm = LLM(
-            model=MODEL_ID, download_dir=CACHE_DIR,
-            dtype="bfloat16", gpu_memory_utilization=0.9,
-            max_model_len=2048
+        
+        engine_args = AsyncEngineArgs(
+            model=MODEL_ID,
+            download_dir=CACHE_DIR,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.9,
+            max_model_len=2048,
         )
+        self.engine = AsyncLLMEngine.from_engine_args(engine_args)
         self.sampling_params = SamplingParams(temperature=0, max_tokens=256)
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     @modal.method()
-    def generate(self, prompt: str) -> str:
+    def generate_stream(self, prompt: str) -> str:
+        """
+        Synchronous generator method that internally drives an async engine.
+        Yields the same envelope format as TransformerRunner.generate_stream:
+            {"type": "prompt_info", "prompt_tokens": int}
+            {"type": "token", "text": str}     (one or more, delta only)
+            {"type": "done"}
+        """
+        import asyncio
+        import uuid
+        import queue
+        import threading
+        import difflib
+
+        @dataclass
+        class _Error:
+            exc: BaseException
 
         messages = [
             {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
@@ -162,10 +182,94 @@ class VLLMRunner:
             tokenize=False,
             add_generation_prompt=True
         )
-        outputs = self.llm.generate(text, self.sampling_params)
-        response = outputs[0].outputs[0].text
+        prompt_token_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+        prompt_tokens = len(prompt_token_ids)
 
-        return response
+        yield {"type": "prompt_info", "prompt_tokens": prompt_tokens}
+
+        # Bridge: drive the async engine from a sync generator.
+        # We use a queue + background thread running asyncio.
+        # The async coroutine puts items onto the queue; this sync method drains it.
+        
+        # TODO 1: Create a thread-safe queue (queue.Queue, not asyncio.Queue,
+        # because we'll drain it from a different thread than the one running asyncio).
+        # Hint: from queue import Queue; q = Queue()
+        q: queue.Queue[any] = queue.Queue(maxsize=32)
+        d = difflib.Differ()
+        stop_event = threading.Event()
+        _DONE = object()
+
+        # TODO 2: Define an async coroutine that:
+        #   - calls self.engine.generate(prompt=text, sampling_params=self.sampling_params, request_id=str(uuid.uuid4()))
+        #   - iterates over its async output: `async for request_output in engine.generate(...)`
+        #   - for each request_output:
+        #       * compute the text delta (cumulative - previous)
+        #       * put a {"type": "token", "text": delta} onto the queue (if delta is non-empty)
+        #       * track previous_text = cumulative
+        #   - after the loop ends, put a sentinel onto the queue to signal completion
+        #     (e.g., None, or {"type": "done"})
+        async def async_producer() -> None:
+            try:
+                prev = ""
+                async for output in self.engine.generate(
+                    prompt=prompt, 
+                    sampling_params=self.sampling_params, 
+                    request_id=str(uuid.uuid4())
+                ):
+                    if stop_event.is_set():
+                        break
+
+                    delta = d.compare(prev, output)
+
+                    if delta:
+                        q.put({
+                            "type": "token",
+                            "text": delta
+                        })
+                    else:
+                        raise ValueError("Empty token")
+                    
+                    prev = output
+
+            except BaseException as exc:
+                q.put(_Error(exc))
+            finally:
+                q.put(_DONE)
+
+        # TODO 3: Run that coroutine in a background thread.
+        #   - Use threading.Thread with target=lambda: asyncio.run(coro())
+        #   - Start the thread
+        def thread_main() -> None:
+            asyncio.run(async_producer())
+        
+        thread = threading.Thread(target=thread_main, daemon=True)
+        thread.start()
+
+        # TODO 4: In this sync method, loop draining the queue:
+        #   - while True: item = q.get()
+        #     - if item is the sentinel: break
+        #     - else: yield item
+        #   - thread.join()
+        try:
+            while True:
+                item = q.get()
+
+                if item is _DONE:
+                    break
+
+                if isinstance(item, _Error):
+                    yield {
+                        "type": "error",
+                        "message": str(item.exc)
+                    }
+                    break
+
+                yield item
+            
+            yield {"type": "done"}
+
+        finally:
+            stop_event.set()
 
 
 @app.local_entrypoint()
