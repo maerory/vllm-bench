@@ -167,7 +167,7 @@ class VLLMRunner:
         import uuid
         import queue
         import threading
-        import difflib
+        from dataclasses import dataclass
 
         @dataclass
         class _Error:
@@ -190,66 +190,45 @@ class VLLMRunner:
         # Bridge: drive the async engine from a sync generator.
         # We use a queue + background thread running asyncio.
         # The async coroutine puts items onto the queue; this sync method drains it.
-        
-        # TODO 1: Create a thread-safe queue (queue.Queue, not asyncio.Queue,
-        # because we'll drain it from a different thread than the one running asyncio).
-        # Hint: from queue import Queue; q = Queue()
-        q: queue.Queue[any] = queue.Queue(maxsize=32)
-        d = difflib.Differ()
+        q = queue.Queue(maxsize=32)
         stop_event = threading.Event()
         _DONE = object()
 
-        # TODO 2: Define an async coroutine that:
-        #   - calls self.engine.generate(prompt=text, sampling_params=self.sampling_params, request_id=str(uuid.uuid4()))
-        #   - iterates over its async output: `async for request_output in engine.generate(...)`
-        #   - for each request_output:
-        #       * compute the text delta (cumulative - previous)
-        #       * put a {"type": "token", "text": delta} onto the queue (if delta is non-empty)
-        #       * track previous_text = cumulative
-        #   - after the loop ends, put a sentinel onto the queue to signal completion
-        #     (e.g., None, or {"type": "done"})
         async def async_producer() -> None:
+            request_id = str(uuid.uuid4())
             try:
                 prev = ""
                 async for output in self.engine.generate(
-                    prompt=prompt, 
+                    prompt=text, 
                     sampling_params=self.sampling_params, 
-                    request_id=str(uuid.uuid4())
+                    request_id=request_id,
                 ):
                     if stop_event.is_set():
+                        await self.engine.abort(request_id)
                         break
-
-                    delta = d.compare(prev, output)
+                    
+                    cumulative = output.outputs[0].text
+                    delta = cumulative[len(prev):]
 
                     if delta:
                         q.put({
                             "type": "token",
                             "text": delta
                         })
-                    else:
-                        raise ValueError("Empty token")
-                    
-                    prev = output
+                    prev = cumulative
 
             except BaseException as exc:
                 q.put(_Error(exc))
             finally:
+                # Always signal completion, even on error (error already on queue if exception)
                 q.put(_DONE)
 
-        # TODO 3: Run that coroutine in a background thread.
-        #   - Use threading.Thread with target=lambda: asyncio.run(coro())
-        #   - Start the thread
         def thread_main() -> None:
             asyncio.run(async_producer())
         
         thread = threading.Thread(target=thread_main, daemon=True)
         thread.start()
 
-        # TODO 4: In this sync method, loop draining the queue:
-        #   - while True: item = q.get()
-        #     - if item is the sentinel: break
-        #     - else: yield item
-        #   - thread.join()
         try:
             while True:
                 item = q.get()
@@ -270,6 +249,7 @@ class VLLMRunner:
 
         finally:
             stop_event.set()
+            thread.join(timeout=0.5)
 
 
 @app.local_entrypoint()
