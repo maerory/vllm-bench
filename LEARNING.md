@@ -295,6 +295,171 @@ Two different RPC protocols. Regular methods use `.remote()` (single request/res
 
 ---
 
+### vLLM streaming: the bridging saga
+
+Trying to wire up vLLM's `AsyncLLMEngine` streaming into a Modal `generate_stream` method took several false starts. Worth writing up because the technical lesson and the meta-lesson are both interview-relevant.
+
+#### The architectural choice
+
+vLLM offers `LLM` (sync, batch-style) and `AsyncLLMEngine` (async, streaming-native). Chose `AsyncLLMEngine` because it's what production serving uses — closer to interview-relevant territory.
+
+#### The wrong approach: bridge sync to async with queue + thread
+
+First attempt: keep the Modal method synchronous (`def generate_stream`), drive vLLM's async engine in a background thread via `asyncio.run`, use a thread-safe `queue.Queue` as the producer-consumer channel.
+
+```python
+@modal.method()
+def generate_stream(self, prompt: str):
+    q = queue.Queue()
+    
+    async def async_producer():
+        async for output in self.engine.generate(...):
+            q.put(...)
+        q.put(_DONE)
+    
+    def thread_main():
+        asyncio.run(async_producer())  # new event loop per request
+    
+    thread = threading.Thread(target=thread_main, daemon=True)
+    thread.start()
+    
+    while True:
+        item = q.get()
+        if item is _DONE: break
+        yield item
+```
+
+This *seemed* right. It compiled, it ran, and produced a generic `EngineDeadError` from `add_request`. After several hypotheses (FlashInfer JIT, prompt keyword, Triton compilation, CUDA toolkit absence), the real root cause turned out to be:
+
+**`AsyncLLMEngine` requires a persistent event loop.** It lazily starts background tasks on whatever loop is running when `generate()` is first called. `asyncio.run()` creates a fresh loop per invocation and closes it on return — so the engine's tasks get attached to a loop that's immediately torn down. The engine becomes unusable.
+
+#### The right approach: make the Modal method `async def`
+
+Modal supports async generator methods natively. The client side (`.remote_gen()`) bridges async-to-sync automatically. The whole queue/thread machinery is unnecessary:
+
+```python
+@modal.method()
+async def generate_stream(self, prompt: str):
+    yield {"type": "prompt_info", "prompt_tokens": prompt_tokens}
+    
+    prev = ""
+    async for output in self.engine.generate(
+        text, self.sampling_params, request_id=str(uuid.uuid4())
+    ):
+        cumulative = output.outputs[0].text
+        delta = cumulative[len(prev):]
+        if delta:
+            yield {"type": "token", "text": delta}
+        prev = cumulative
+    
+    yield {"type": "done"}
+```
+
+Modal handles the event loop. vLLM gets the persistent loop it needs. The harness is unchanged — `.remote_gen()` returns a sync iterator either way.
+
+#### The technical lesson
+
+When you have an async producer (vLLM), an async transport (Modal), and your code is the glue — **make the glue async too**. The queue/thread/asyncio.run pattern is for when one of the boundaries genuinely forces sync. Neither did here.
+
+Decision tree:
+1. Is the engine async-native? → Yes (vLLM)
+2. Does the transport support async? → Yes (Modal)
+3. Then write the method as `async def`. Don't bridge.
+
+Reach for queue+thread bridging only when one boundary is sync-only (a library that must be sync, a framework without async support).
+
+#### The meta-lesson: diagnose before iterating on implementation
+
+After the first failure, I (Claude) proposed fixes inside the queue/thread framing: improve error reporting, swap base images, try positional args. None worked. The bug never was inside that framing — it was the framing itself.
+
+The right move at the second or third failure would have been to step back and ask "is the architecture right?" rather than "what's the next thing to try inside the architecture?" Iterating on a wrong frame produces tired engineers and no progress. Generalizable: when iterating isn't working, change the frame.
+
+This is the same principle Claude has been coaching me on for interviews — diagnose before prescribing, exhaust cheap interventions before architectural changes — applied in reverse. Worth flagging.
+
+#### Side concept: how exceptions cross boundaries (threads, processes, RPC)
+
+Hunting the original error surfaced something fundamental about exception propagation.
+
+**Exceptions don't cross boundaries for free.** Whenever code spans a thread, process, or network boundary, you must:
+1. Catch the exception inside the boundary
+2. Serialize its useful state (type, message, **full traceback as a string**)
+3. Propagate the serialized form across
+4. Reconstruct/raise on the other side
+
+Anything not explicitly serialized is lost.
+
+Specifically:
+- Thread exceptions die silently by default (no auto-propagation to main thread)
+- `traceback` objects are not picklable — they reference C-level frame objects bound to the originating interpreter
+- `traceback.format_exc()` produces a plain string that survives any boundary
+- This applies to Python threads, multiprocessing, Celery, gRPC, REST, Modal RPC — same principle, different surface
+
+Caught the exception in the producer (good), but only stringified the message (`str(exc)`), not the traceback. That's why the first error was "EngineCore encountered an issue" with no detail — the actual traceback was attached to the exception object, but never extracted before the object was discarded.
+
+The fix:
+```python
+except BaseException as exc:
+    import traceback
+    q.put(_Error(exc, traceback.format_exc()))
+```
+
+Once the traceback was preserved across the boundary, the real error (`EngineDeadError` from `add_request`) was immediately visible.
+
+### Session 2 final results: vLLM vs transformers at concurrency 1
+
+Both runners working end-to-end. Full 30-prompt benchmark on each.
+
+| Metric | Tier | transformers | vLLM | Delta |
+|---|---|---|---|---|
+| TTFT mean (ms) | short | 442 | 457 | +3% |
+| | medium | 430 | 435 | +1% |
+| | long | 433 | 442 | +2% |
+| ITL mean (ms) | short | 35.9 | 15.2 | **–58%** |
+| | medium | 37.0 | 15.3 | **–59%** |
+| | long | 36.9 | 15.4 | **–58%** |
+| Decode tput (tok/s) | short | 27.8 | 66.6 | **+139%** |
+| | medium | 27.1 | 65.6 | **+142%** |
+| | long | 27.1 | 65.4 | **+141%** |
+| E2E tput (tok/s) | short | 25.4 | 55.7 | **+119%** |
+| | medium | 25.9 | 59.0 | **+128%** |
+| | long | 25.9 | 58.7 | **+127%** |
+| Total time (s) | short | 7.84 | 3.62 | **–54%** |
+| | medium | 9.89 | 4.34 | **–56%** |
+| | long | 9.89 | 4.36 | **–56%** |
+
+#### Headline findings
+
+**1. vLLM at concurrency 1 is ~2.4x faster on decode than transformers.** Bigger than I expected. This is *without* batching — there's only one request in flight, so vLLM's continuous batching isn't doing anything. The win is purely from per-stream efficiency: FlashAttention kernels, native sampler, cleaner Python/GPU memory boundary, less per-step overhead.
+
+Interview-ready phrasing:
+
+> "On my own setup, vLLM at concurrency 1 was about 2.4x faster on per-token decode than naive transformers, on a 3B model on an A10G. That's entirely from kernel efficiency — continuous batching is inactive at concurrency 1. The batching wins come on top of this baseline once concurrency rises."
+
+**2. TTFT is essentially identical across both runners** (within 1-3%). Confirms the prior hypothesis: RPC overhead dominates TTFT at these prompt sizes, drowning out any prefill differences between engines.
+
+Interview-ready phrasing:
+
+> "Client-side TTFT for prompts under ~300 tokens was dominated by network and RPC overhead, hiding any prefill differences between engines. To see prefill scale, you'd need much longer prompts or engine-side timing."
+
+**3. ITL is remarkably tier-flat for both runners.** Decode step cost doesn't depend on prompt length at these sizes. KV cache effects aren't visible until much longer contexts.
+
+**4. Absolute time savings grow with output length.** Short tier saves ~4.2s; medium and long save ~5.5s each. The longer the generation, the more decode efficiency compounds into wall-time savings.
+
+#### Sanity check on the absolute numbers
+
+For a 3B model on A10G in bfloat16, A10G memory bandwidth is ~600 GB/s. Decode is memory-bandwidth-bound for small batches. Theoretical ceiling ~100-120 tok/s. Observed:
+
+- transformers @ 27 tok/s = ~25% of bandwidth — sensible for naive PyTorch
+- vLLM @ 65 tok/s = ~55% of bandwidth — sensible for optimized kernels
+
+Both numbers pass the sniff test. If transformers had been 5 tok/s or vLLM 200 tok/s, something would be broken.
+
+#### What's still missing for "interview-ready"
+
+The 2.4x is the per-stream win. Concurrency >1 is where vLLM's *architectural* win (continuous batching) shows up. Session 3 will produce the batching numbers — that's where the throughput curve really takes off and the cost-per-token economics become defensible.
+
+---
+
 ## Open questions / parking lot
 
 Things I deferred and want to revisit:
