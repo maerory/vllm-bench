@@ -14,7 +14,10 @@ image = (
 )
 
 vllm_image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.0-devel-ubuntu22.04",
+        add_python="3.11",
+    )
     .pip_install("vllm==0.21.0")
 )
 
@@ -155,7 +158,7 @@ class VLLMRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     @modal.method()
-    def generate_stream(self, prompt: str) -> str:
+    async def generate_stream(self, prompt: str) -> str:
         """
         Synchronous generator method that internally drives an async engine.
         Yields the same envelope format as TransformerRunner.generate_stream:
@@ -163,15 +166,13 @@ class VLLMRunner:
             {"type": "token", "text": str}     (one or more, delta only)
             {"type": "done"}
         """
-        import asyncio
         import uuid
-        import queue
-        import threading
         from dataclasses import dataclass
 
         @dataclass
         class _Error:
             exc: BaseException
+            traceback: str
 
         messages = [
             {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
@@ -187,70 +188,21 @@ class VLLMRunner:
 
         yield {"type": "prompt_info", "prompt_tokens": prompt_tokens}
 
-        # Bridge: drive the async engine from a sync generator.
-        # We use a queue + background thread running asyncio.
-        # The async coroutine puts items onto the queue; this sync method drains it.
-        q = queue.Queue(maxsize=32)
-        stop_event = threading.Event()
-        _DONE = object()
-
-        async def async_producer() -> None:
-            request_id = str(uuid.uuid4())
-            try:
-                prev = ""
-                async for output in self.engine.generate(
-                    prompt=text, 
-                    sampling_params=self.sampling_params, 
-                    request_id=request_id,
-                ):
-                    if stop_event.is_set():
-                        await self.engine.abort(request_id)
-                        break
-                    
-                    cumulative = output.outputs[0].text
-                    delta = cumulative[len(prev):]
-
-                    if delta:
-                        q.put({
-                            "type": "token",
-                            "text": delta
-                        })
-                    prev = cumulative
-
-            except BaseException as exc:
-                q.put(_Error(exc))
-            finally:
-                # Always signal completion, even on error (error already on queue if exception)
-                q.put(_DONE)
-
-        def thread_main() -> None:
-            asyncio.run(async_producer())
+        request_id = str(uuid.uuid4())
+        prev = ""
+        async for output in self.engine.generate(
+            text,
+            self.sampling_params,
+            request_id=request_id,
+        ):
+            cumulative = output.outputs[0].text
+            delta = cumulative[len(prev):]
+            if delta:
+                yield {"type": "token", "text": delta}
+            prev = cumulative
         
-        thread = threading.Thread(target=thread_main, daemon=True)
-        thread.start()
-
-        try:
-            while True:
-                item = q.get()
-
-                if item is _DONE:
-                    break
-
-                if isinstance(item, _Error):
-                    yield {
-                        "type": "error",
-                        "message": str(item.exc)
-                    }
-                    break
-
-                yield item
-            
-            yield {"type": "done"}
-
-        finally:
-            stop_event.set()
-            thread.join(timeout=0.5)
-
+        yield {"type": "done"}
+        
 
 @app.local_entrypoint()
 def main(runner: str = "transformers"):

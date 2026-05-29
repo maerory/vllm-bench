@@ -100,6 +100,9 @@ def consume_stream(stream, t_request_sent: float):
             token_arrival_times.append(time.time() - t_request_sent)
         elif event["type"] == "done":
             t_complete = time.time()
+        elif event["type"] == "error":
+            tb = event.get("traceback", "(no traceback captured)")
+            raise RuntimeError(f"Runner error: {event['message']}\n\nRemote traceback:\n{tb}")
         else:
             raise ValueError(f"Unknown event: {event["type"]}")
 
