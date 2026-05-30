@@ -458,6 +458,89 @@ Both numbers pass the sniff test. If transformers had been 5 tok/s or vLLM 200 t
 
 The 2.4x is the per-stream win. Concurrency >1 is where vLLM's *architectural* win (continuous batching) shows up. Session 3 will produce the batching numbers — that's where the throughput curve really takes off and the cost-per-token economics become defensible.
 
+### Core concepts: prefill vs decode, and what "kernel" means
+
+Two foundational concepts that come up constantly in LLM serving discussions. Worth crisp definitions.
+
+#### Two phases of inference: prefill and decode
+
+LLM generation has two phases with **very different compute characteristics**.
+
+**Prefill.** Process the entire input prompt in one big forward pass. All prompt tokens go through every transformer layer simultaneously, computing the keys and values for each token at each layer (this populates the "KV cache"). One forward pass, but it processes hundreds of tokens at once.
+
+**Decode.** Generate output, one token at a time. For each new token:
+1. Run the model on *just the one most recently generated token*, attending over all the cached KVs from the prompt + previous output tokens.
+2. Get logits for the next token.
+3. Sample / argmax.
+4. Detokenize the chosen ID into text.
+5. Repeat.
+
+So "decode phase" = "the autoregressive generation loop." Each iteration is one forward pass with sequence length 1.
+
+**The bottlenecks are different:**
+
+| Phase | Seq len per forward | Bottleneck | Why |
+|---|---|---|---|
+| Prefill | hundreds of tokens | Compute-bound | Lots of parallel matmul work; GPU compute units saturate |
+| Decode | 1 token | Memory-bandwidth-bound | Tiny compute per step, but must read all 5.79GB of weights every step |
+
+This explains why TTFT (mostly prefill) and ITL (per-decode-step) move so differently:
+- TTFT roughly scales with prompt length × model size, bounded by compute
+- ITL is roughly constant per step regardless of prompt length, bounded by memory bandwidth
+
+**The two meanings of "decode" — a vocabulary trap:**
+
+There's a separate, narrower meaning of "decode": the tokenizer step `tokenizer.decode(token_id) → text` that turns an integer back into a string. This is the inverse of tokenizer-encode and happens *inside* each decode-phase step (step 4 in the list above). It's microseconds — pure string lookup.
+
+When people say "decode is the bottleneck" in serving, they mean the *whole autoregressive loop* (the model forward pass dominates), not the tokenizer.decode call. Distinction worth keeping straight.
+
+**Interview-ready phrasing:**
+
+> "Prefill is compute-bound — long sequence in one forward pass, lots of parallel matmul work, GPU saturates. Decode is memory-bandwidth-bound — each step does very little compute but has to read all the model's weights from HBM to produce one token. Optimizing the two is basically a different problem."
+
+#### What is a "kernel"?
+
+A **kernel** in GPU programming is just a function that runs on the GPU. Terminology comes from CUDA.
+
+It's overloaded with unrelated meanings elsewhere (OS kernel, kernel functions in math/ML, kernel methods in SVMs). All unrelated. In serving discussions: kernel = "GPU function written in CUDA C++, compiled by nvcc, runs on thousands of GPU threads in parallel."
+
+When you call `torch.matmul(A, B)` in Python, PyTorch eventually calls a CUDA kernel under the hood. The kernel does the actual math; PyTorch is orchestration.
+
+**Why kernel efficiency varies:**
+
+The same operation can be implemented as many different kernels with very different performance. Concrete: matrix multiplication has dozens of CUDA implementations, each making different choices about:
+- How to split work across thousands of GPU threads
+- Which memory tier (registers vs shared memory vs HBM) at each step
+- How to overlap computation with memory loading
+- Boundary handling for non-divisible dimensions
+- Whether to use specialized tensor-core instructions
+
+Naive matmul kernel: ~10% of theoretical throughput. Well-tuned (cuBLAS): 90%+. Same math, 9x performance difference. *That's* kernel efficiency.
+
+#### Why vLLM's kernels beat transformers' kernels
+
+`transformers` is general-purpose: arbitrary models, debuggability, broad compatibility. Default ops call generic CUDA kernels (cuBLAS, cuDNN) — excellent for general math, blind to LLM-specific structure.
+
+vLLM is purpose-built for LLM inference. Specific wins:
+
+1. **FlashAttention.** Standard attention: compute `Q @ K^T` → huge intermediate matrix → softmax → multiply by `V`. The intermediate gets written to HBM and read back. FlashAttention restructures so the intermediate stays in on-chip memory. Same math, much less memory traffic. ~2-4x on attention specifically. `transformers` can use it (`attn_implementation="flash_attention_2"`) but doesn't by default; vLLM does by default.
+
+2. **Fused operations.** Each kernel launch has overhead (CPU → GPU dispatch). At decode (seq_len=1), individual ops are tiny, so launch overhead dominates. Naive PyTorch: layer norm, linear, activation, residual = 4 separate kernel calls. vLLM fuses these into single kernels. Modest individually (~1.2x) but adds up.
+
+3. **PagedAttention.** vLLM's signature contribution. Standard attention assumes contiguous KV cache memory; wastes memory with variable-length requests or batches. PagedAttention manages cache in non-contiguous pages (like OS virtual memory), enabling much better utilization and supporting continuous batching efficiently. More memory-layout than raw kernel speed, but enables behaviors that pure kernel optimization can't.
+
+4. **Optimized sampler kernels.** Top-k, top-p, temperature scaling. PyTorch's defaults are general but not optimized for "small batch, low latency, high frequency." vLLM uses FlashInfer (or its own native sampler — what we forced with `VLLM_USE_FLASHINFER_SAMPLER=0`).
+
+5. **Reduced Python overhead per step.** Each PyTorch forward involves non-trivial Python work — kernel dispatch, type checks, etc. For decode (tiny per step), this matters. vLLM has a tighter inner loop.
+
+**The wins compound, they don't add.** Each is modest individually (1.2-2x). Multiplied together: ~2-3x, which matches our observed 2.4x decode speedup.
+
+**Interview-ready phrasing:**
+
+> "vLLM's single-stream win over transformers comes from a handful of LLM-specific kernel optimizations: FlashAttention to reduce attention's memory traffic, fused operations to reduce kernel-launch overhead, optimized sampler kernels, and a tighter Python inner loop. Each is modest individually — maybe 20-50% — and they compound. On my A10G with a 3B model I observed about 2.4x, which is consistent with compounded gains. The architectural win — continuous batching via PagedAttention — is separate and only activates at concurrency >1."
+
+This is the answer that signals you know the difference between "vLLM is fast because batching" (the marketing answer) and the actual mechanism.
+
 ---
 
 ## Open questions / parking lot
