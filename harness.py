@@ -8,6 +8,7 @@ Session 2 scope: concurrency 1 only. Sequential loop over prompts.
 """
 
 import argparse
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field, asdict
@@ -33,7 +34,7 @@ REPO_ROOT = Path(__file__).parent.resolve()
 
 @dataclass
 class GenerationResult:
-    """Per-prompt measurement record. Raw data; derived metrics computed later."""
+    """Per-prompt measurement record."""
     prompt_id: str
     tier: str
     prompt: str
@@ -56,6 +57,11 @@ class GenerationResult:
     # (TextIteratorStreamer yields decoded fragments).
     token_arrival_times: list[float] = field(default_factory=list)
 
+    # Batch context - for concurrency > 1, identified which batch this was in
+    batch_id: int = 0
+    batch_t_start: float = 0.0
+    batch_t_end: float = 0.0
+
 
 @dataclass
 class RunMetadata:
@@ -66,6 +72,7 @@ class RunMetadata:
     started_at: str             # ISO 8601
     finished_at: str
     n_prompts: int
+    n_batches: int = 0
     notes: str = ""
 
 
@@ -119,6 +126,55 @@ def consume_stream(stream, t_request_sent: float):
 
 
 # =============================================================================
+# Async stream consumer
+# =============================================================================
+
+async def consume_stream_async(stream, t_request_sent: float):
+    """
+    Consume an async generator from a runner, recording timings.
+
+    Same envelope format as sync version:
+        {"type": "prompt_info", "prompt_tokens": int}
+        {"type": "token", "text": str}
+        {"type": "done"}
+        {"type": "error", "message": str, "traceback": str}
+
+    Returns: (prompt_tokens, output_text, t_first_token, t_complete, token_arrival_times)
+    """
+    prompt_tokens = None
+    output_chunks = []
+    token_arrival_times = []
+    t_first_token = None
+    t_complete = None
+
+    async for event in stream:
+        if event["type"] == "prompt_info":
+            prompt_tokens = event["prompt_tokens"]
+        elif event["type"] == "token":
+            if t_first_token is None:
+                t_first_token = time.time()
+            output_chunks.append(event["text"])
+            token_arrival_times.append(time.time() - t_request_sent)
+        elif event["type"] == "done":
+            t_complete = time.time()
+        elif event["type"] == "error":
+            tb = event.get("traceback", "(no traceback_captured)")
+            raise RuntimeError(f"Runtime error: {event['message']}\n\nRemote traceback:\n{tb}")
+        else:
+            raise ValueError(f"Unknown event: {event["type"]}")
+        
+    if prompt_tokens is None:
+        raise ValueError(f"Prompt info event never arrived.")
+    if t_first_token is None:
+        raise ValueError(f"No token received")
+    if t_complete is None:
+        raise ValueError(f"No complete event: Stream was abruptly ended")
+    
+
+    output_text = "".join(output_chunks)
+    return prompt_tokens, output_text, t_first_token, t_complete, token_arrival_times
+
+# =============================================================================
 # Token counting (output side)
 # =============================================================================
 
@@ -131,6 +187,89 @@ def count_output_tokens(text: str, tokenizer) -> int:
     TextIteratorStreamer yields text fragments, not 1:1 tokens.
     """
     return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+# =============================================================================
+# Per-prompt async worker
+# =============================================================================
+
+async def process_prompt(
+    runner,
+    prompt: dict,
+    tokenizer,
+    batch_id: int,
+    batch_t_start: float,
+) -> GenerationResult:
+    """
+    Fire one prompt at the runner, consume its stream, record the result.
+    This coroutine is what gets fanned out via asyncio.gather.
+    """
+    t_request_sent = time.time()
+    stream = runner.generate_stream.remote_gen.aio(prompt["prompt"])
+    prompt_tokens, output_text, t_first_token, t_complete, token_arrival_times = await consume_stream_async(stream, t_request_sent)
+    output_token_count = count_output_tokens(output_text, tokenizer)
+
+    return GenerationResult(
+        prompt_id=prompt["id"],
+        tier=prompt["tier"],
+        prompt=prompt["prompt"],
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_token_count,
+        output_text=output_text,
+        t_request_sent=t_request_sent,
+        t_first_token=t_first_token,
+        t_complete=t_complete,
+        token_arrival_times=token_arrival_times,
+        batch_id=batch_id,
+        batch_t_start=batch_t_start,
+        batch_t_end=0.0,
+    )
+
+# =============================================================================
+# Concurrent batch runner
+# =============================================================================
+
+def chunks(lst: list, n: int):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+async def run_batch(
+    runner,
+    batch: list[dict],
+    tokenizer,
+    batch_id: int,
+) -> list[GenerationResult]:
+    """
+    Fire all prompts in a batch concurrently, wait for all to complete,
+    return the per-prompt results with batch-level timestamps filled in.
+    """
+    batch_t_start = time.time()
+
+    # TODO 3: 
+    # 1. Build a list of coroutines: [process_prompt(runner, p, tokenizer, batch_id, batch_t_start) for p in batch]
+    # 2. await asyncio.gather(*tasks) to fire them all concurrently and collect results.
+    # Hint: asyncio.gather returns results in the same order as the input list.
+    coros = [
+        process_prompt(
+            runner, 
+            prompt_record, 
+            tokenizer, 
+            batch_id, 
+            batch_t_start
+        ) 
+        for prompt_record in batch
+    ]
+
+    results: list[GenerationResult] = await asyncio.gather(*coros, return_exceptions=False)
+
+    batch_t_end = time.time()
+
+    # Stamp the batch_t_end on every result
+    for r in results:
+        r.batch_t_end = batch_t_end
+
+    return results
 
 
 # =============================================================================
@@ -231,65 +370,134 @@ def run_benchmark(
     print(f"\nWrote {len(results)} results to {output_path}")
 
 
+async def run_benchmark_async(
+    runner_name: str,
+    prompts: list[dict],
+    concurrency: int,
+    output_path: Path,
+    warmup: bool = True,
+) -> None:
+    
+    if runner_name == "transformers":
+        if concurrency != 1:
+            raise ValueError(
+                "transformers runner only supports concurrency=1 in this benchmark. "
+                "See LEARNING.md for why."
+            )
+        runner = TransformerRunner()
+    elif runner_name == "vllm":
+        runner = VLLMRunner()
+    else:
+        raise ValueError(f"Unknown runner: {runner_name}")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+    if warmup:
+        print("Warming up runner (this triggers container start + model load)...")
+        # TODO 4: warmup needs to work with the async generator now.
+        # Hint: just iterate (async for _ in runner.generate_stream.remote_gen.aio("Ping."): pass)
+        # so the engine is ready before timed batches start.
+        async for _ in runner.generate_stream.remote_gen.aio("Ping."):
+            pass
+
+    # Iterate over batches
+    results: list[GenerationResult] = []
+    started_at = datetime.now(UTC).isoformat()
+
+    batches = list(chunks(prompts, concurrency))
+    print(f"Will run {len(prompts)} prompts in {len(batches)} batches of concurrency {concurrency}")
+
+    for batch_id, batch in enumerate(batches):
+        print(f"\n[Batch {batch_id+1}/{len(batches)}] firing {len(batch)} prompts concurrently...")
+        batch_results = await run_batch(runner, batch, tokenizer, batch_id)
+
+        # Per-prompt summary lines
+        batch_wall = batch_results[0].batch_t_end - batch_results[0].batch_t_start
+        total_out_tokens = sum(r.output_tokens for r in batch_results)
+        batch_throughput = total_out_tokens / batch_wall if batch_wall > 0 else 0.0
+
+        for r in batch_results:
+            ttft = r.t_first_token - r.t_request_sent
+            total_time = r.t_complete - r.t_request_sent
+            print(
+                f"  {r.prompt_id} ({r.tier}): "
+                f"ttft={ttft*1000:.0f}ms total={total_time:.2f}s out_tokens={r.output_tokens}"
+            )
+        print(
+            f"  → batch wall time: {batch_wall:.2f}s, "
+            f"system throughput: {batch_throughput:.1f} tok/s"
+        )
+
+        results.extend(batch_results)
+
+    finished_at = datetime.now(UTC).isoformat()
+
+    metadata = RunMetadata(
+        runner=runner_name,
+        model_id=MODEL_ID,
+        concurrency=concurrency,
+        started_at=started_at,
+        finished_at=finished_at,
+        n_prompts=len(prompts),
+        n_batches=len(batches),
+    )
+
+    blob = {
+        "metadata": asdict(metadata),
+        "results": [asdict(r) for r in results],
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(blob, f, indent=2)
+
+    print(f"\nWrote {len(results)} results to {output_path}")
+
+
+
+
 # =============================================================================
 # CLI
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="vllm-bench harness")
+    parser.add_argument("--runner", choices=["transformers", "vllm"], required=True)
     parser.add_argument(
-        "--runner",
-        choices=["transformers", "vllm"],
-        required=True,
-        help="Which runner to benchmark",
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of concurrent in-flight requests (vLLM only for C>1)",
     )
     parser.add_argument(
         "--prompts",
         type=Path,
         default=REPO_ROOT / "prompts" / "benchmark_set.json",
-        help="Path to prompt set JSON",
     )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Output JSON path (default: results/<date>-<runner>-c1.json)",
-    )
-    parser.add_argument(
-        "--no-warmup",
-        action="store_true",
-        help="Skip warmup request (not recommended; cold-start will pollute first result)",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Run only the first N prompts (for quick iteration during development)",
-    )
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
-    # Load prompts
     with open(args.prompts) as f:
         prompts = json.load(f)
     if args.limit:
         prompts = prompts[: args.limit]
 
-    # Default output path
     if args.output is None:
         date_str = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        args.output = REPO_ROOT / "results" / f"{date_str}-{args.runner}-c1.json"
+        args.output = REPO_ROOT / "results" / f"{date_str}-{args.runner}-c{args.concurrency}.json"
 
-    # Modal-aware: the harness needs to run inside `with app.run():` so that
-    # Modal connects to its backend and provisions containers on demand.
-    # Without this, .remote() calls will fail.
     with app.run():
-        run_benchmark(
-            runner_name=args.runner,
-            prompts=prompts,
-            output_path=args.output,
-            warmup=not args.no_warmup,
+        asyncio.run(
+            run_benchmark_async(
+                runner_name=args.runner,
+                prompts=prompts,
+                concurrency=args.concurrency,
+                output_path=args.output,
+                warmup=not args.no_warmup,
+            )
         )
-
 
 if __name__ == "__main__":
     main()

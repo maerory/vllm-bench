@@ -83,7 +83,6 @@ class TransformerRunner:
     
     @modal.method()
     def generate_stream(self, prompt: str):
-        import torch
         import time
         from transformers import TextIteratorStreamer
         from threading import Thread
@@ -127,7 +126,7 @@ class TransformerRunner:
                 "server_ts": time.time(),
             }
         
-        thread.join()
+        thread.join(timeout=1.0)
         yield {"type": "done"}
 
 
