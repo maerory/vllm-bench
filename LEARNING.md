@@ -543,6 +543,123 @@ This is the answer that signals you know the difference between "vLLM is fast be
 
 ---
 
+## Session 3 — Concurrency sweep
+
+**Goal:** Measure how vLLM's continuous batching scales with concurrent requests. Compare against the transformers C=1 baseline. Sweep at C=1, C=4, C=8 (account-tier ceiling of 10).
+
+### The bug that hid the real story: `@modal.concurrent` default is 1
+
+First sweep produced confusing data — throughput barely improved with concurrency (1.4x at C=16), TTFT degraded catastrophically (P95 of 49 seconds), and per-request decode throughput was stable across all concurrency levels. Spent significant time hypothesizing what was wrong:
+- Was vLLM not batching effectively at this model size?
+- Were we memory-bandwidth-saturated single-stream?
+- Was something pathological happening in scheduling?
+
+The actual answer: **Modal's default container concurrency is 1.** Even when the client fires 16 concurrent requests, Modal's input dispatcher queues them and the container processes them one at a time. vLLM's continuous batcher never received a second request to batch with — there was no batching to measure.
+
+The fix: add `@modal.concurrent(max_inputs=10)` decorator to the `VLLMRunner` class.
+
+```python
+@app.cls(...)
+@modal.concurrent(max_inputs=10)   # was missing entirely
+class VLLMRunner:
+    ...
+```
+
+After the fix, the data made sense immediately.
+
+### The generalizable principle: client concurrency ≠ server concurrency
+
+This is the real lesson, broader than Modal:
+
+> When measuring concurrent throughput, the question is always: **where does parallelism actually start?** Client-side concurrency is necessary but not sufficient. If any layer between client and engine has a serialization point lower than your target concurrency, the rest is queuing.
+
+The same pattern shows up in many places:
+- **Web servers:** worker pool size (Apache `MaxRequestWorkers`, Gunicorn `workers`, etc.)
+- **Database connection pools:** pool size caps real concurrency
+- **Thread pools:** `ThreadPoolExecutor(max_workers=N)` accepts unlimited tasks but only runs N
+- **Cloud function platforms:** Lambda, Cloud Run each have their own concurrency models
+- **GPU inference servers:** Triton, TGI, vLLM's OpenAI server all have per-instance concurrency settings
+
+The diagnostic question to ask: trace the request path from client through every layer, and find the lowest concurrency cap. That's your effective concurrency, regardless of what the client thinks.
+
+**Concrete:** Modal's default is 1 input per container. vLLM's default with continuous batching is hundreds. Those two defaults disagree. If you don't reconcile them, you've inadvertently configured vLLM to never batch — and your measurement will tell you continuous batching doesn't work, which is the wrong conclusion.
+
+**Interview-ready phrasing:**
+
+> "When you're measuring concurrent throughput, the question is always: where does parallelism actually start? Client-side concurrency is necessary but not sufficient. I learned this empirically — my first vLLM batching numbers showed only 1.4x scaling, which made no sense for continuous batching. Root cause: Modal's default container concurrency is 1, so concurrent client requests serialized at the container boundary and never reached vLLM's batcher. Once I reconciled the two defaults, the proper batching numbers showed up — about 7x at C=8."
+
+### Account-tier ceiling: 10 concurrent
+
+Free / lower-tier Modal accounts cap concurrency at 10 across the account. This forced the sweep down from the brief's suggested C=16/32/64 to C=1/4/8.
+
+Doesn't materially affect the project. The interesting transitions for a 3B model on A10G are at the *low* end of the concurrency curve anyway — that's where you go from "no batching" to "batching effective" to "approaching saturation." Whether saturation is at C=8 or C=16 or C=32 doesn't change the story.
+
+Worth noting as a retro point: **production serving ceilings are usually imposed by something other than the engine itself** — quotas, network limits, GPU memory, autoscaler policies. You design concurrency strategy around the actual constraint, not the engine's theoretical capability.
+
+### The real results: continuous batching scaling
+
+| C | System tput (tok/s) | Speedup vs C=1 | Per-req decode (tok/s) | P95 TTFT (ms) | Total time p50 (s) |
+|---|---|---|---|---|---|
+| 1 | 56.9 | 1.00x | 66 | 463 | 4.35 |
+| 4 | 201.1 | **3.53x** | 65 | 456 | 4.43 |
+| 8 | 397.8 | **6.99x** | 66 | 628 | 4.41 |
+
+#### Five observations from the data
+
+**1. Per-request decode throughput is stable across concurrency.** At C=1, C=4, and C=8, each individual request decodes at ~65 tok/s. This is the signature of true continuous batching: each request gets the same per-step decode efficiency, but the GPU's per-step compute is shared across requests. From the user's perspective, their request runs as fast as it would alone; from the system's perspective, you're doing N requests at once for roughly the cost of one.
+
+This is *the* insight to articulate: continuous batching does not speed up individual requests. It increases system throughput by sharing the per-step GPU compute across in-flight requests.
+
+**2. TTFT degrades gracefully, not catastrophically.** P95 TTFT goes from 463ms at C=1 to 628ms at C=8 — a 35% degradation for 7x throughput. The engine schedules prefill alongside in-flight decode work; individual requests don't wait minutes for their first token. The latency-throughput trade-off behaves sanely.
+
+(Contrast with the buggy serialized data, which had P95 TTFT of 49 seconds at C=16 — that was *queueing* at the container boundary, not real concurrency.)
+
+**3. Scaling is sub-linear but efficient.** 
+
+- C=4: 3.53x = 88% scaling efficiency
+- C=8: 6.99x = 87% scaling efficiency
+
+The ~12% loss reflects scheduler overhead, prefill-decode contention within batches, and prompts hitting EOS at different times (batch-size variance). 87% efficiency at C=8 is genuinely good for batched serving.
+
+**4. Total request latency is roughly constant across concurrency.** P50 total time: 4.35s → 4.43s → 4.41s as C goes 1 → 4 → 8. Latency essentially flat. Throughput up 7x. **You serve 7x more requests in the same amount of time, with no user noticing.** This is the marketing pitch for continuous batching, reproduced empirically on this setup.
+
+**5. Headroom remains beyond C=8.** Observed 398 tok/s at C=8; pure-decode peak (ignoring prefill, sampling, scheduling) is ~800 tok/s on this hardware. We're at ~50% of theoretical decode peak. More headroom exists at C=10 with diminishing returns approaching HBM bandwidth saturation.
+
+#### Sanity check on the numbers
+
+Theoretical: A10G has ~600 GB/s HBM bandwidth; model is 5.79 GB in bf16. Per-decode-step the GPU reads the full model weights once. Pure-decode peak ≈ 600/5.79 ≈ 100 forward passes/s. At C=N you produce N tokens per pass. So theoretical decode-only throughput at C=8 is ~800 tok/s, observed 398 — a sensible factor-of-2 gap once you include prefill, sampling, and scheduling. The math checks out.
+
+#### The cross-runner headline
+
+Comparing across the project (transformers C=1 as fixed baseline):
+
+| Runner | C | System tput (tok/s) | Speedup vs transformers |
+|---|---|---|---|
+| transformers | 1 | ~27 | 1.0x |
+| vLLM | 1 | 56.9 | 2.1x |
+| vLLM | 4 | 201.1 | 7.4x |
+| vLLM | 8 | 397.8 | **14.7x** |
+
+Two distinct wins, compounding:
+1. **Kernel efficiency** (single-stream): ~2.1x. FlashAttention, fused ops, native sampler, tighter inner loop.
+2. **Continuous batching** (concurrent requests): ~7x at C=8 on top of #1.
+
+**Interview-ready phrasing for the full story:**
+
+> "On a 3B model on A10G, vLLM at C=8 was about 14.7x faster system-throughput than naive transformers single-stream. That 14.7x decomposes into two distinct architectural wins: kernel-level efficiency gives ~2.1x at concurrency 1 from optimizations like FlashAttention and fused operations, and continuous batching gives a further ~7x at C=8 on top of that. They're independent and they compound. Importantly, per-request decode latency stayed stable across concurrency — continuous batching doesn't speed up individual requests, it shares the per-step GPU compute across concurrent ones."
+
+### Session 3 retrospective: what surprised me
+
+1. **The Modal default ate three sessions of analysis.** The initial C=4/16 sweep took longer to diagnose than to run. Generalizable lesson: when measurements don't match theory, suspect the measurement infrastructure before suspecting the system being measured.
+
+2. **The scaling is more linear than I expected.** Going in, I expected a clear knee somewhere below C=8 — the model is small, the GPU is moderate, HBM bandwidth is the wall. Instead, 87% scaling efficiency held to C=8. The knee is past my account ceiling, not below it.
+
+3. **The latency story is more graceful than I expected.** I assumed P95 TTFT would balloon at C=8 (it did in the buggy data, giving me false confidence in this prediction). In reality, vLLM's scheduler handles up to C=8 with only modest TTFT degradation. Continuous batching is well-implemented.
+
+4. **The transformers-vs-vLLM gap is bigger than the single-stream comparison suggested.** 2.4x at C=1 understated the architectural advantage; the real comparison at C=8 is 14.7x. The marketing case for vLLM gets stronger as you actually exercise its design.
+
+---
+
 ## Open questions / parking lot
 
 Things I deferred and want to revisit:

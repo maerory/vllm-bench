@@ -136,6 +136,7 @@ class TransformerRunner:
     volumes={CACHE_DIR: volume},
     timeout=600,
 )
+@modal.concurrent(max_inputs=10)
 class VLLMRunner:
     @modal.enter()
     def load_model(self):
