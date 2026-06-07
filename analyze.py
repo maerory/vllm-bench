@@ -208,8 +208,13 @@ def render_run_summary(run: dict, metadata: dict) -> str:
     
     if metadata.get("gpu_memory_peak"):
         gm = metadata["gpu_memory_peak"]
-        lines.append(f"- GPU memory peak: {gm.get('device_used_gb', 0):.2f} GB (device), "
-                    f"{gm.get('torch_peak_gb', 0):.2f} GB (PyTorch-tracked)")
+        device_used = gm.get("device_used_gb")
+        torch_peak = gm.get("torch_peak_gb", 0)
+        if device_used is not None:
+            lines.append(
+                f"- GPU memory: {device_used:.2f} GB device-wide, "
+                f"{torch_peak:.2f} GB PyTorch-tracked in main process"
+            )
         
     return "\n".join(lines)
 

@@ -180,10 +180,33 @@ class VLLMRunner:
 
     @modal.method()
     def get_gpu_memory_peak(self):
+        import subprocess
         import torch
+
+        # PyTorch-side trackers (only meaningful if this process did the allocations)
+        torch.cuda.init()
+        torch_peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        torch_current_gb = torch.cuda.memory_allocated() / (1024**3)
+
+        # nvidia-smi for cross-process truth
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, check=True,
+            )
+            used_mib, total_mib = [int(x.strip()) for x in result.stdout.split(",")]
+            device_used_gb = used_mib / 1024
+            device_total_gb = total_mib / 1024
+        except Exception as e:
+            device_used_gb = None
+            device_total_gb = None
+
         return {
-            "peak_gb": torch.cuda.max_memory_allocated() / (1024**3),
-            "allocated_gb": torch.cuda.memory_allocated() / (1024**3),
+            "torch_peak_gb": torch_peak_gb,
+            "torch_current_gb": torch_current_gb,
+            "device_used_gb": device_used_gb,
+            "device_total_gb": device_total_gb,
         }
 
     @modal.method()
