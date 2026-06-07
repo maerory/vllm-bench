@@ -78,6 +78,7 @@ def aggregate_by_tier(metrics: list[dict]) -> dict[str, dict]:
             "throughput_e2e_mean": statistics.mean(i["throughput_e2e"] for i in items),
             "throughput_decode_mean": statistics.mean(i["throughput_decode"] for i in items),
             "itl_ms_mean": statistics.mean(i["itl_ms"] for i in items),
+            "itl_ms_p99": percentile([i["itl_ms"] for i in items], 99),
         }
     return summary
 
@@ -204,7 +205,14 @@ def render_run_summary(run: dict, metadata: dict) -> str:
     lines.append(f"- TTFT p99: {run['ttft_ms_p99_overall']:.0f}ms")
     lines.append(f"- Total time p50: {run['total_s_p50_overall']:.2f}s")
     lines.append(f"- Total time p95: {run['total_s_p95_overall']:.2f}s")
+    
+    if metadata.get("gpu_memory_peak"):
+        gm = metadata["gpu_memory_peak"]
+        lines.append(f"- GPU memory peak: {gm.get('device_used_gb', 0):.2f} GB (device), "
+                    f"{gm.get('torch_peak_gb', 0):.2f} GB (PyTorch-tracked)")
+        
     return "\n".join(lines)
+
 
 
 def render_batch_table(batches: list[dict]) -> str:

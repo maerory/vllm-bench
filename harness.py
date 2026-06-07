@@ -73,6 +73,7 @@ class RunMetadata:
     finished_at: str
     n_prompts: int
     n_batches: int = 0
+    gpu_memory_peak: dict | None = None
     notes: str = ""
 
 
@@ -246,10 +247,6 @@ async def run_batch(
     """
     batch_t_start = time.time()
 
-    # TODO 3: 
-    # 1. Build a list of coroutines: [process_prompt(runner, p, tokenizer, batch_id, batch_t_start) for p in batch]
-    # 2. await asyncio.gather(*tasks) to fire them all concurrently and collect results.
-    # Hint: asyncio.gather returns results in the same order as the input list.
     coros = [
         process_prompt(
             runner, 
@@ -309,6 +306,7 @@ def run_benchmark(
     if warmup:
         print("Warming up runner (this triggers container start + model load)...")
         list(runner.generate_stream.remote_gen("Ping."))
+        runner.reset_memory_stats.remote()
 
     # Main benchmark loop
     results: list[GenerationResult] = []
@@ -347,6 +345,13 @@ def run_benchmark(
         )
 
     finished_at = datetime.now(UTC).isoformat()
+    
+    # Capture GPU memory peak from the runner
+    try:
+        gpu_memory_peak = runner.get_gpu_memory_peak.remote()
+    except Exception as exc:
+        print(f"Warning: failed to capture GPU memory: {exc}")
+        gpu_memory_peak = None
 
     # Build full result blob and write to disk
     metadata = RunMetadata(
@@ -356,6 +361,7 @@ def run_benchmark(
         started_at=started_at,
         finished_at=finished_at,
         n_prompts=len(prompts),
+        gpu_memory_peak=gpu_memory_peak,
     )
 
     blob = {
@@ -393,12 +399,11 @@ async def run_benchmark_async(
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     if warmup:
-        print("Warming up runner (this triggers container start + model load)...")
-        # TODO 4: warmup needs to work with the async generator now.
-        # Hint: just iterate (async for _ in runner.generate_stream.remote_gen.aio("Ping."): pass)
-        # so the engine is ready before timed batches start.
+        print("Warming up runner...")
         async for _ in runner.generate_stream.remote_gen.aio("Ping."):
             pass
+        # Reset memory tracking so the peak only reflects the timed runs
+        await runner.reset_memory_stats.remote.aio()
 
     # Iterate over batches
     results: list[GenerationResult] = []
@@ -431,6 +436,12 @@ async def run_benchmark_async(
         results.extend(batch_results)
 
     finished_at = datetime.now(UTC).isoformat()
+    # Capture GPU memory peak from the runner
+    try:
+        gpu_memory_peak = await runner.get_gpu_memory_peak.remote.aio()
+    except Exception as exc:
+        print(f"Warning: failed to capture GPU memory: {exc}")
+        gpu_memory_peak = None
 
     metadata = RunMetadata(
         runner=runner_name,
@@ -440,6 +451,7 @@ async def run_benchmark_async(
         finished_at=finished_at,
         n_prompts=len(prompts),
         n_batches=len(batches),
+        gpu_memory_peak=gpu_memory_peak,
     )
 
     blob = {

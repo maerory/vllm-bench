@@ -52,6 +52,22 @@ class TransformerRunner:
 
         volume.commit()
 
+    @modal.method()
+    def reset_memory_stats(self):
+        import torch
+        torch.cuda.reset_peak_memory_stats()
+
+    @modal.method()
+    def get_gpu_memory_peak(self):
+        import torch
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        return {
+            "torch_peak_gb": torch.cuda.max_memory_allocated() / (1024**3),
+            "torch_current_gb": torch.cuda.memory_allocated() / (1024**3),
+            "device_used_gb": used / (1024**3),
+            "device_total_gb": total / (1024**3),
+        }
 
     @modal.method()
     def generate(self, prompt: str) -> str:
@@ -158,6 +174,19 @@ class VLLMRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     @modal.method()
+    def reset_memory_stats(self):
+        import torch
+        torch.cuda.reset_peak_memory_stats()
+
+    @modal.method()
+    def get_gpu_memory_peak(self):
+        import torch
+        return {
+            "peak_gb": torch.cuda.max_memory_allocated() / (1024**3),
+            "allocated_gb": torch.cuda.memory_allocated() / (1024**3),
+        }
+
+    @modal.method()
     async def generate_stream(self, prompt: str) -> str:
         """
         Synchronous generator method that internally drives an async engine.
@@ -202,6 +231,8 @@ class VLLMRunner:
             prev = cumulative
         
         yield {"type": "done"}
+
+    
         
 
 @app.local_entrypoint()
