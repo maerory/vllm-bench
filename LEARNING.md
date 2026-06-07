@@ -658,6 +658,124 @@ Two distinct wins, compounding:
 
 4. **The transformers-vs-vLLM gap is bigger than the single-stream comparison suggested.** 2.4x at C=1 understated the architectural advantage; the real comparison at C=8 is 14.7x. The marketing case for vLLM gets stronger as you actually exercise its design.
 
+## Session 4 — Stability, GPU memory capture, P99 latency
+
+**Goal:** Close the brief's definition-of-done gaps. Repeat-run stability check, GPU memory capture, P99 ITL.
+
+### Stability across runs
+
+Three runs of vLLM C=8 sweep, system throughput in tok/s:
+
+| Run | System tput (tok/s) | P95 TTFT (ms) | P50 total (s) |
+|---|---|---|---|
+| 1 | 397.8 | 628 | 4.41 |
+| 2 | 365.7 | 627 | 4.78 |
+| 3 | 404.2 | 578 | 4.36 |
+
+Mean: 389.2 tok/s. Spread: ~±5% from mean. Within the brief's 10% stability threshold.
+
+Run 2 was uniformly slightly slower across most time-based metrics (throughput, total time, ITL). Runs 1 and 3 cluster tightly. The directional skew suggests it's not pure jitter — likely sources are shared-tenancy GPU heterogeneity (different physical machine, different noisy-neighbor patterns) or CUDA graph cache warmth differences. Not investigated further; within tolerance for this project.
+
+**Retro-worthy observation:** Most students post their first set of numbers as fact. The variance lurks beneath any single benchmark run. A rigorous benchmark would report mean ± std dev across multiple runs, not just within-run percentiles. Worth flagging the methodology limitation explicitly.
+
+### GPU memory capture: the cross-process gotcha
+
+Added a `get_gpu_memory_peak` method to both runners. First attempt used only `torch.cuda.max_memory_allocated()` and `torch.cuda.mem_get_info()`.
+
+Transformers returned sensible numbers: 5.90 GB PyTorch-tracked, 6.34 GB device-wide. Matches expectations (5.79 GB model + 1 stream's KV cache + CUDA context).
+
+**vLLM returned 0.00 GB for everything** — clearly wrong.
+
+Root cause: vLLM 0.21 with the V1 engine runs the model in a **subprocess** (`EngineCore`), not in the main Modal container process. Visible in the startup logs as `(EngineCore pid=18)`. The `@modal.method` runs in the main container process; `torch.cuda` queries from that process don't see the subprocess's allocations.
+
+Specifically:
+- `torch.cuda.max_memory_allocated()` is per-process — returns 0 because the main process never allocated PyTorch tensors on GPU.
+- `torch.cuda.mem_get_info()` *should* see device-wide state, but the main process hadn't initialized a CUDA context, so it returned zeros.
+
+**Fix:** use `nvidia-smi` via subprocess for the cross-process truth. `nvidia-smi` queries the driver directly, sees all processes, doesn't care about Python-process boundaries.
+
+```python
+@modal.method()
+def get_gpu_memory_peak(self):
+    import subprocess
+    import torch
+
+    torch.cuda.init()  # force context init for PyTorch trackers
+    torch_peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    torch_current_gb = torch.cuda.memory_allocated() / (1024**3)
+
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True,
+    )
+    used_mib, total_mib = [int(x.strip()) for x in result.stdout.split(",")]
+
+    return {
+        "torch_peak_gb": torch_peak_gb,
+        "torch_current_gb": torch_current_gb,
+        "device_used_gb": used_mib / 1024,
+        "device_total_gb": total_mib / 1024,
+    }
+```
+
+For transformers, both numbers agree (same process). For vLLM, PyTorch-tracked is 0 (main process never touched the GPU) but `device_used_gb` shows the truth (~20 GB).
+
+**Generalizable lesson:** Be careful with per-process introspection APIs when measuring multi-process systems. The same trap exists with Python's `psutil` for CPU memory, with `time.process_time()` for CPU time, with anything that says "the current process." `nvidia-smi`, `/proc/meminfo`, `top` — these query the kernel/driver and see everything.
+
+### The memory comparison: vLLM's pre-allocation strategy
+
+| Runner | C | Device memory | What's in it |
+|---|---|---|---|
+| transformers | 1 | 6.34 GB | Model weights (~5.79 GB) + 1 stream's KV cache + CUDA context |
+| vLLM | 8 | 20.01 GB | Model + ~13 GB pre-allocated KV cache pool + CUDA graphs + context |
+
+**The ~13 GB gap is KV cache headroom that vLLM is sitting on at startup, regardless of actual concurrency.** vLLM's startup log earlier reported:
+
+> `GPU KV cache size: 380,080 tokens` / `Maximum concurrency for 2,048 tokens per request: 185.59x`
+
+That 13 GB literally is the "ready to serve up to 185 concurrent 2K-token requests" capacity. Most of it is unused during the C=8 benchmark. vLLM pre-allocates it because PagedAttention depends on having the pool available — pages get assigned to in-flight sequences and recycled, but the pool itself is allocated once at startup.
+
+The `gpu_memory_utilization=0.9` parameter is what controls this: vLLM grabs 90% of available GPU memory at startup for its KV cache pool, regardless of how many requests you actually have.
+
+**Interview-ready phrasing:**
+
+> "vLLM allocated about 20 GB on a 24 GB A10G, regardless of concurrency level — `gpu_memory_utilization=0.9` tells it to claim 90% of available memory for the KV cache pool. Transformers used about 6 GB. The ~13 GB gap is KV cache headroom that vLLM is sitting on — enough for ~185 concurrent 2K-token sequences according to its startup log. The trade-off is concrete: vLLM trades upfront memory commitment for the ability to scale concurrency without runtime allocation overhead. Transformers grows its KV cache lazily per request — tiny footprint when idle, but caps at one stream at a time."
+
+This is the kind of substantive memory-management answer that distinguishes "I know vLLM uses PagedAttention" from "I measured what PagedAttention actually does."
+
+### P99 ITL added
+
+Per the brief, P99 ITL is a required field. Added to `aggregate_by_tier` and rendered in the per-tier table.
+
+Numbers from the final C=8 run:
+
+| Tier | ITL mean (ms) | ITL p99 (ms) |
+|---|---|---|
+| short | 15.6 | 16.5 |
+| medium | 16.4 | 16.5 |
+| long | 16.7 | 17.1 |
+
+P99 ITL is tight — within ~5% of mean. No catastrophic per-token stalls. This confirms that vLLM's scheduler at C=8 produces a smooth decode stream without long pauses, which is what you'd want for interactive serving.
+
+(At higher concurrency we'd expect P99 ITL to widen as the scheduler occasionally deprioritizes one request to handle prefill of new arrivals. At C=8 there's not enough scheduling pressure to see this.)
+
+### Session 4 closure
+
+Brief's definition of done:
+
+| Item | Status |
+|---|---|
+| Two runners working | ✅ |
+| Harness with ≥3 concurrency levels recording wall time, throughput, TTFT, ITL | ✅ |
+| Results table for both runners | ✅ |
+| Numbers stable across re-runs (within ~10%) | ✅ (3 runs of C=8, spread ±5%) |
+| Peak GPU memory captured | ✅ |
+| P99 ITL captured | ✅ |
+| Written retrospective | session 5 |
+
+Everything except the retrospective is done.
+
 ---
 
 ## Open questions / parking lot
