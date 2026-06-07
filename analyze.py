@@ -173,6 +173,7 @@ def aggregate_run(metrics: list[dict], metadata: dict) -> dict:
         "ttft_ms_p99_overall": percentile([m["ttft_ms"] for m in metrics], 99),
         "total_s_p50_overall": percentile([m["total_s"] for m in metrics], 50),
         "total_s_p95_overall": percentile([m["total_s"] for m in metrics], 95),
+        "itl_ms_p99": percentile([i["itl_ms"] for i in metrics], 99),
     }
 
 
@@ -259,7 +260,7 @@ def render_tier_table(summary: dict[str, dict]) -> str:
         "Tier", "n",
         "Prompt tok", "Out tok",
         "TTFT mean (ms)", "TTFT p50 (ms)", "TTFT p95 (ms)",
-        "Total (s)", "Tput per-req (tok/s)", "Tput decode (tok/s)", "ITL mean (ms)",
+        "Total (s)", "Tput per-req (tok/s)", "Tput decode (tok/s)", "ITL mean (ms)", "ITL p99",
     ]
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join(["---"] * len(headers)) + "|")
@@ -278,6 +279,7 @@ def render_tier_table(summary: dict[str, dict]) -> str:
             f"{s['throughput_e2e_mean']:.1f}",
             f"{s['throughput_decode_mean']:.1f}",
             f"{s['itl_ms_mean']:.1f}",
+            f"{s["itl_ms_p99"]:.2f}"
         ]
         lines.append("| " + " | ".join(row) + " |")
 
